@@ -70,7 +70,7 @@ def calculate_structural_lifespan(feature_clusters, evap_map, coords, cluster_la
         
     return np.min(lifespans), lifespans
 
-def get_initial_baseline_metrics(model, grid_3d):
+def Topo_Init_evaluation():
     # 静默求解 COMSOL 初始拓扑，提取并返回基准性能
     current_path = os.path.dirname(os.path.abspath(__file__))
     client = mph.start(cores=CORES)
