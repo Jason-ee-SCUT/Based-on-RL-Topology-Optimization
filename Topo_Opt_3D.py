@@ -6,350 +6,352 @@ import os
 import trimesh
 import scipy.ndimage as ndimage
 from scipy.interpolate import griddata
-from scipy.ndimage import distance_transform_edt
 from skimage import measure
 from stable_baselines3 import PPO
 import torch
 import torch.nn as nn
+import cupy as cp
+from cupyx.scipy.ndimage import distance_transform_edt as c_edt
+from cupyx.scipy.ndimage import gaussian_filter as c_gaussian
+from cupyx.scipy.ndimage import zoom as c_zoom
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-
 from physics_tools import (
-    GRID_SIZE, 
-    VOXEL_SIZE, 
-    RHO_DENSITY,
-    initialize_cylinder_grid, 
-    extract_characteristic_length, 
-    calculate_evaporation_rate, 
-    calculate_structural_lifespan,
-    Topo_Init_evaluation
-    )
-
-
-# 限制PyTorch使用的CPU线程数，把更多算力留给后端的 COMSOL 物理场求解
-torch.set_num_threads(16)
+    GRID_SIZE, VOXEL_SIZE, RHO_DENSITY,
+    initialize_cylinder_grid, calculate_evaporation_rate, 
+     Topo_Init_evaluation
+)
 
 class TungstenTopologyEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, client):
         super(TungstenTopologyEnv, self).__init__()
-        
-        # 定义全局参数
+        self.client = client
         self.grid_size = GRID_SIZE
         self.voxel_size = VOXEL_SIZE
         self.rho_density = RHO_DENSITY
         
-        # 初始化通信
-        print("正在启动 COMSOL 服务器...")
-        self.client = mph.start(cores=16)
+        self.max_steps = 1000 
         
         current_path = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_path,'Topo_Opt_3D.mph')
-        if os.path.exists(model_path):
-            self.model = self.client.load(model_path)
-        else:
-            print(f"【警告】未找到 {model_path}，使用随机假数据模式供调试。")
-            self.model = None
+        model_path = os.path.join(current_path, 'Topo_Opt_3D.mph')
+        self.model = self.client.load(model_path) if os.path.exists(model_path) else None
             
-        # 定义状态空间与动作空间
+        # 状态空间为3通道: [SDF边界, 温度场, 寿命场]
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, 
-            shape=(3, self.grid_size[0], self.grid_size[1], self.grid_size[2]), 
+            shape=(3, 50, 50, 75),
             dtype=np.float32
-        )
-        # 3D 动作空间需 6 个参数：(x1, y1, z1) 用于挖除，(x2, y2, z2) 用于填补
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
+            )
         
-        # 初始化环境演化参数
+        # 动作空间：低频连续密度修改
+        self.action_shape = (self.grid_size[0]//5, self.grid_size[1]//5, self.grid_size[2]//5)
+        self.action_space = spaces.Box(low=-0.15, high=0.15, shape=self.action_shape, dtype=np.float32)
+        
         self.step_count = 0
         self.output_dir = "./topology_evolution"
         os.makedirs(self.output_dir, exist_ok=True)
-        
-        # 生成带电极掩码的初始体素网格
-        self.current_voxel_grid = self._initialize_agent_grid()
+        self.target_volume = 0.0
+        self._initialize_masks()
 
-        # 获取初始参数。
-        print("正在进行初始物理基准评估，请稍候...")
+        # 基准评估
         try:
-            init_life, init_rad, init_eff = Topo_Init_evaluation()
+            init_life, init_rad, init_eff = Topo_Init_evaluation(self.client)
             self.initial_life = init_life
             self.initial_radiation = init_rad
             self.initial_efficiency = init_eff
-            print(f"【基准获取成功】寿命: {init_life:.2e}s | 辐射: {init_rad:.2f}W | 效率: {init_eff*100:.2f}%")
+            print(f"【基准】寿命: {init_life:.2e}s | 辐射: {init_rad:.2f}W | 效率: {init_eff*100:.2f}%")
         except Exception as e:
-            print(f"【警告】基准提取失败，使用安全默认值。错误: {e}")
-            self.initial_life = 100.0
-            self.initial_radiation = 50.0
-            self.initial_efficiency = 0.5
+            print(f"基准提取失败: {e}")
+            self.initial_life, self.initial_radiation, self.initial_efficiency = 100.0, 50.0, 0.5
 
-    def _initialize_agent_grid(self):
-        # 初始化智能体视角的网格。
-        # 添加“不可修改电极区域”。
-        grid = initialize_cylinder_grid()
-        
-        nx, ny, nz = self.grid_size
-        self.frozen_mask = np.zeros_like(grid, dtype=bool)
-        radius = 25 
-        z_start, z_end = 0, nz
-        
-        x, y, z = np.ogrid[:nx, :ny, :nz]
-        dist_sq = (x - nx//2)**2 + (y - ny//2)**2
-        
-        electrode_thickness = 2 # 电极厚度为2个体素
-        bottom_electrode = (dist_sq <= radius**2) & (z >= z_start) & (z < z_start + electrode_thickness)
-        top_electrode = (dist_sq <= radius**2) & (z > z_end - electrode_thickness) & (z <= z_end)
-        
-        self.frozen_mask[bottom_electrode] = True
-        self.frozen_mask[top_electrode] = True
-        
-        return grid
+        # 缓存初始物理场
+        self.base_temp_map = None
+        self.base_lifespan_map = None
+        self._cache_baseline_fields()
 
-    def _run_comsol_simulation_3d(self, grid_3d):
-        #运行 COMSOL 联合仿真
-        nx, ny, nz = self.grid_size
-        
-        if self.model is None:
-            return np.ones((nx, ny, nz), dtype=np.float32) * 2500.0, 50.0, 100.0, 2500.0
-
-        closed_grid = ndimage.binary_closing(grid_3d, structure=np.ones((3, 3, 3))).astype(np.float32)
-        smoothed_grid = ndimage.gaussian_filter(closed_grid, sigma=1.5)
+    def _cache_baseline_fields(self):
+        print("正在缓存初始圆柱体的 3D 物理场 (仅执行一次)...")
+        # 临时生成一个标准圆柱体
+        binary_grid = initialize_cylinder_grid()
+        self.density_field = binary_grid.astype(np.float32)
+        self.current_voxel_grid = binary_grid.copy()
         
         try:
-            verts, faces, normals, values = measure.marching_cubes(smoothed_grid, 0.5)
-            mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
-            mesh.fill_holes() 
-            trimesh.smoothing.filter_laplacian(mesh, iterations=5) 
-            
-            current_path = os.path.dirname(os.path.abspath(__file__))
-            stl_path = os.path.join(current_path, 'temp_topology.stl')
+            temp_map, _, _, max_temp = self._run_comsol_simulation_3d()
+            evap_map = calculate_evaporation_rate(temp_map)
+            self.base_temp_map = temp_map
+            self.base_lifespan_map = self._calculate_lifespan_map(self.current_voxel_grid, evap_map)
+            print(f"基准场缓存成功！中心最高温度约: {max_temp:.2f}K")
+        except Exception as e:
+            print(f"缓存基准场失败: {e}，使用假数据")
+            # 假数据
+            self.base_temp_map = np.ones(self.grid_size, dtype=np.float32) * 2500.0
+            self.base_lifespan_map = np.ones(self.grid_size, dtype=np.float32) * 1e5
+
+    def _initialize_masks(self):
+        nx, ny, nz = self.grid_size
+        self.frozen_mask = np.zeros((nx, ny, nz), dtype=bool)
+        radius = 25 
+        x, y, z = np.ogrid[:nx, :ny, :nz]
+        dist_sq = (x - nx//2)**2 + (y - ny//2)**2
+        # 固定上下电极
+        self.frozen_mask[(dist_sq <= radius**2) & (z < 2)] = True
+        self.frozen_mask[(dist_sq <= radius**2) & (z > nz - 3)] = True
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed, options=options)
+        
+        # 恢复几何与密度到初始圆柱体状态
+        binary_grid = initialize_cylinder_grid()
+        self.valid_mask = ~self.frozen_mask
+        self.target_volume = np.sum(binary_grid[self.valid_mask])
+        self.density_field = binary_grid.astype(np.float32)
+        self.current_voxel_grid = binary_grid.copy()
+        self.step_count = 0
+        
+        # 复用初始物理场
+        return self._get_obs(temp=self.base_temp_map, lifespan_map=self.base_lifespan_map), {}
+
+    def _apply_density_action(self, action):
+        action_gpu = cp.asarray(action)
+        zoom_factors = (self.grid_size[0]/self.action_shape[0], 
+                self.grid_size[1]/self.action_shape[1], 
+                self.grid_size[2]/self.action_shape[2])
+        delta_rho = c_zoom(action_gpu, zoom_factors, order=1) 
+        delta_rho = c_gaussian(delta_rho, sigma=1.2)
+        delta_rho = cp.asnumpy(delta_rho) 
+
+        # 释放内存
+        del action_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+    
+        # 防止形状不匹配
+        target_shape = self.grid_size
+        pad_width = []
+        for i in range(3):
+          diff = target_shape[i] - delta_rho.shape[i]
+          if diff > 0:
+            pad_width.append((0, diff))
+          elif diff < 0:
+            pad_width.append((0, 0))
+            delta_rho = delta_rho[(slice(None),) * i + (slice(0, target_shape[i]),)]
+          else:
+            pad_width.append((0, 0))
+        if any(p[1] > 0 for p in pad_width):
+          delta_rho = np.pad(delta_rho, pad_width, mode='edge')
+    
+        raw_density = self.density_field + delta_rho
+        
+        # 二分法体积守恒投影
+        def calc_vol(offset):
+            projected = np.clip(raw_density[self.valid_mask] + offset, 0.0, 1.0)
+            return np.sum(projected)
+
+        l_min, l_max = -2.0, 2.0
+        for _ in range(40): 
+            l_mid = (l_min + l_max) / 2.0
+            if calc_vol(l_mid) > self.target_volume: l_max = l_mid
+            else: l_min = l_mid
+                
+        optimal_offset = (l_min + l_max) / 2.0
+        self.density_field[self.valid_mask] = np.clip(raw_density[self.valid_mask] + optimal_offset, 0.0, 1.0)
+        
+        # 保护电极
+        self.density_field[self.frozen_mask & (self.current_voxel_grid == 1)] = 1.0
+        self.density_field[self.frozen_mask & (self.current_voxel_grid == 0)] = 0.0
+
+        self.current_voxel_grid = (self.density_field >= 0.5).astype(np.float32)
+
+    def _extract_mesh(self):
+        verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
+        mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
+        trimesh.smoothing.filter_laplacian(mesh, iterations=2)
+        return mesh
+
+    def _run_comsol_simulation_3d(self):
+        if self.model is None:
+            print("未找到基准模型，用假数据调试代码")
+            return np.ones(self.grid_size)*2500.0, 50.0, 100.0, 2500.0
+
+        model = self.model
+        try:
+            mesh = self._extract_mesh()
+            stl_path = os.path.join(self.output_dir, 'temp_topo.stl')
             mesh.export(stl_path)
 
-            geom = self.model.java.component("comp1").geom("geom1")
+            geom = model.java.component("comp1").geom("geom1")
             geom.feature("imp1").set("filename", stl_path)
             geom.run()
+            model.java.component("comp1").mesh(str(model.java.component("comp1").mesh().tags()[0])).run()
+            model.java.study(str(model.java.study().tags()[0])).run()
 
-            mesh_tags = self.model.java.component("comp1").mesh().tags()
-            target_mesh = str(mesh_tags[0]) if len(mesh_tags) > 0 else "mesh1"
-            if len(mesh_tags) == 0: self.model.java.component("comp1").mesh().create(target_mesh)
-            self.model.java.component("comp1").mesh(target_mesh).run()
+            net_rad = float(model.evaluate('Total_Rad'))       
+            p_in = float(model.evaluate('P_in'))           
+            max_temp = float(model.evaluate('Max_Temp')) 
             
-            study_tags = self.model.java.study().tags()
-            target_study = str(study_tags[0])
-            self.model.java.study(target_study).run()
-
-            net_rad = self.model.evaluate('Total_Rad')       
-            p_in = self.model.evaluate('P_in')           
-            max_temp = self.model.evaluate('Max_Temp') 
+            # 提取温度场
+            x_c, y_c, z_c = model.evaluate('x')*1000, model.evaluate('y')*1000, model.evaluate('z')*1000
+            t_p = model.evaluate('T')
+            x_g, y_g, z_g = np.meshgrid(np.arange(self.grid_size[0]), np.arange(self.grid_size[1]), np.arange(self.grid_size[2]), indexing='ij')
             
-            x_coords = self.model.evaluate('x') * 1000  
-            y_coords = self.model.evaluate('y') * 1000
-            z_coords = self.model.evaluate('z') * 1000
-            temp_points = self.model.evaluate('T')
-
-            x_grid, y_grid, z_grid = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
-            x_grid_m = x_grid * self.voxel_size
-            y_grid_m = y_grid * self.voxel_size
-            z_grid_m = z_grid * self.voxel_size
-            
-            temp_map = griddata(
-                (x_coords.ravel(), y_coords.ravel(), z_coords.ravel()), 
-                temp_points.ravel(), 
-                (x_grid_m, y_grid_m, z_grid_m), 
-                method='nearest'
-            ).astype(np.float32)
-            
-            temp_map = np.nan_to_num(temp_map, nan=300.0)
-            
-            return temp_map, float(net_rad), float(p_in), float(max_temp)
+            temp_map = griddata((x_c.ravel(), y_c.ravel(), z_c.ravel()), t_p.ravel(), 
+                                (x_g*self.voxel_size, y_g*self.voxel_size, z_g*self.voxel_size), method='nearest')
+            temp_map = np.nan_to_num(temp_map.astype(np.float32), nan=300.0)
+            # 清理COMSOL缓存
+            model.java.mesh(str(model.java.component("comp1").mesh().tags()[0])).clear()
+            model.java.sol("sol1").clearSolutionData()
+            return temp_map, net_rad, p_in, max_temp
             
         except Exception as e:
-            print(f"【拦截】COMSOL 几何重构或求解失败，错误信息: {str(e)[:100]}...")
-            raise RuntimeError("COMSOL Simulation Failed")
+            raise RuntimeError(f"COMSOL Error: {str(e)[:80]}")
 
     def _check_structural_integrity(self):
-        # 连通性检查
-        structure = ndimage.generate_binary_structure(3, 3) 
-        labeled_array, num_features = ndimage.label(self.current_voxel_grid, structure=structure)
-        if num_features > 1:
-            return False
-        return True
+        labeled_array, num_features = ndimage.label(self.current_voxel_grid)
+        return num_features == 1
 
     def step(self, action):
         self.step_count += 1
-        
-        # 拓扑优化动作
-        success, modified_count = self._apply_3d_brush_action(action, brush_radius=3)
-        if not success:
-            return self._get_obs(), -2.0, False, False, {"error": "Invalid action"}
+        self._apply_density_action(action)
             
-        # 物理约束：拦截孤立碎片
         if not self._check_structural_integrity():
-            return self._get_obs(), -50.0, True, False, {"error": "Structural fragmentation"}
+            return self._get_obs(), -50.0, True, False, {"error": "Fragmentation"}
             
-        # 执行 COMSOL 联合仿真
         try:
-            temp_map, net_rad, p_in, max_temp = self._run_comsol_simulation_3d(self.current_voxel_grid)
+            temp_map, net_rad, p_in, max_temp = self._run_comsol_simulation_3d()
         except Exception as e:
-            return self._get_obs(), -100.0, True, False, {"error": "COMSOL Non-convergence"}
+            return self._get_obs(), -80.0, True, False, {"error": "COMSOL Fail"}
             
-        # 温度约束
         if max_temp > 3273.15:
-            return self._get_obs(), -50.0, True, False, {"error": "Temperature limit exceeded"}
+            return self._get_obs(temp_map=temp_map), -50.0, True, False, {"error": "Temp > 3000C"}
             
-        # 性能评估
         evap_map = calculate_evaporation_rate(temp_map) 
-        feature_clusters, coords, cluster_labels = extract_characteristic_length(self.current_voxel_grid)
         
-        if not feature_clusters:
-            return self._get_obs(), -100.0, True, False, {"error": "No solid structure left"}
-
-        # 寿命评估
-        topo_life, _ = calculate_structural_lifespan(feature_clusters, evap_map, coords, cluster_labels)
-
+        # 计算全空间寿命图谱
+        lifespan_map = self._calculate_lifespan_map(self.current_voxel_grid, evap_map)
+        topo_life = np.min(lifespan_map[self.current_voxel_grid > 0.5]) # 提取最短寿命用于奖励
+        
         efficiency = net_rad / p_in if p_in > 1e-5 else 0.0 
 
-        self._save_evolution_frame(efficiency, topo_life)
+        if self.step_count % 10 == 0: self._save_evolution_frame(efficiency, topo_life)
         reward = self._calculate_reward(efficiency, topo_life)
-        obs = self._get_obs(temp_map, evap_map)
         
-        return obs, reward, False, False, {
-            "life": topo_life, 
-            "radiation": net_rad,
-            "efficiency": efficiency,
-            "max_temp": max_temp
-        }
+        # 传入 temp_map 和 lifespan_map
+        obs = self._get_obs(temp_map, lifespan_map)
+        
+        truncated = bool(self.step_count >= self.max_steps)
+        return obs, reward, False, truncated, {"life": topo_life, "rad": net_rad, "eff": efficiency}
         
     def _calculate_reward(self, efficiency, topo_life):
         # 计算奖励
-        w1 = 20.0 # 辐射功率奖励系数
-        r_eff = w1 * np.clip((efficiency / self.initial_efficiency), -5.0, 5.0)
+        # 能量转换效率增益 (目标提升>30%)
+        eff_gain = (efficiency - self.initial_efficiency) / self.initial_efficiency
+        r_eff = 15.0 * np.tanh(4.0 * eff_gain) 
         
-        w2 = 5.0 # 拓扑寿命奖励系数
-        p_life = 0.0
-        red_line = 0.3 * self.initial_life
-        
-        if topo_life < red_line:
-            shortfall_ratio = (red_line - topo_life) / red_line
-            p_life = -50.0 * (shortfall_ratio ** 2)
+        # 寿命约束与激励 (目标 > 50%)
+        life_ratio = topo_life / self.initial_life
+        if life_ratio < 0.3:
+            # 触碰红线给予平方级惩罚
+            r_life = -100.0 * ((0.3 - life_ratio) / 0.3) ** 2
         else:
-            p_life = w2 * np.clip((topo_life / self.initial_life), 0.0, 2.0)
+            # 鼓励向50%以上突破
+            r_life = 10.0 * np.tanh(3.0 * (life_ratio - 0.3))
             
-        return float(r_eff + p_life)
+        return float(r_eff + r_life)
 
     def _save_evolution_frame(self, efficiency, topo_life):
-        # 保存演化帧和指标日志
-        if self.step_count % 10 != 0:
-            return
-            
-        smoothed_grid = ndimage.gaussian_filter(self.current_voxel_grid, sigma=1.0)
-        verts, faces, normals, values = measure.marching_cubes(smoothed_grid, 0.5)
+        verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
         mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
-        
-        stl_filename = os.path.join(self.output_dir, f"frame_{self.step_count:05d}.stl")
-        mesh.export(stl_filename)
-        
-        log_path = os.path.join(self.output_dir, "performance_log.csv")
-        write_header = not os.path.exists(log_path)
-        with open(log_path, 'a') as f:
-            if write_header: f.write("Step,Efficiency,LifeSpan\n")
-            f.write(f"{self.step_count},{efficiency:.4f},{topo_life:.2f}\n")
+        mesh.export(os.path.join(self.output_dir, f"frame_{self.step_count:05d}.stl"))
+        with open(os.path.join(self.output_dir, "log.csv"), 'a') as f:
+            f.write(f"{self.step_count},{efficiency:.4f},{topo_life:.2e}\n")
 
-    def reset(self, seed=None):
-        # 回合重置
-        super().reset(seed=seed)
-        self.current_voxel_grid = self._initialize_agent_grid()
-        return np.zeros(self.observation_space.shape, dtype=np.float32), {}
+    def _get_obs(self, temp=None, lifespan_map=None):
+        target_shape = (50, 50, 75)        
+        zoom_factor = (
+            target_shape[0] / self.grid_size[0],
+            target_shape[1] / self.grid_size[1],
+            target_shape[2] / self.grid_size[2]
+            )
         
-    def _apply_3d_brush_action(self, action, brush_radius=2):
-        # 3D 绝对体积守恒球形笔刷
-        nx, ny, nz = self.grid_size
+        #  Ch 0: SDF
+        voxel_gpu = cp.asarray(self.current_voxel_grid)
+        inside_dist = c_edt(voxel_gpu)
+        outside_dist = c_edt(1 - voxel_gpu)
+        sdf_full = cp.asnumpy(inside_dist - outside_dist)
         
-        x1 = int(np.clip((action[0] + 1.0) / 2.0 * (nx - 1), 0, nx - 1))
-        y1 = int(np.clip((action[1] + 1.0) / 2.0 * (ny - 1), 0, ny - 1))
-        z1 = int(np.clip((action[2] + 1.0) / 2.0 * (nz - 1), 0, nz - 1))
+        # 释放GPU
+        del voxel_gpu, inside_dist, outside_dist
+        cp.get_default_memory_pool().free_all_blocks()
+
+        # 降采样 SDF
+        sdf_down = ndimage.zoom(sdf_full, zoom_factor, order=1)
         
-        x2 = int(np.clip((action[3] + 1.0) / 2.0 * (nx - 1), 0, nx - 1))
-        y2 = int(np.clip((action[4] + 1.0) / 2.0 * (ny - 1), 0, ny - 1))
-        z2 = int(np.clip((action[5] + 1.0) / 2.0 * (nz - 1), 0, nz - 1))
-
-        rm_candidates, add_candidates = [], []
+        # SDF 归一化
+        max_dist = self.grid_size[0] / 2.0
+        sdf_norm = np.clip(sdf_down / max_dist, -1.0, 1.0) 
         
-        for dx in range(-brush_radius, brush_radius + 1):
-            for dy in range(-brush_radius, brush_radius + 1):
-                for dz in range(-brush_radius, brush_radius + 1):
-                    if dx**2 + dy**2 + dz**2 <= brush_radius**2:
-                        # 收集待挖点
-                        cx1, cy1, cz1 = x1 + dx, y1 + dy, z1 + dz
-                        if 0 <= cx1 < nx and 0 <= cy1 < ny and 0 <= cz1 < nz:
-                            if self.current_voxel_grid[cx1, cy1, cz1] == 1.0 and not self.frozen_mask[cx1, cy1, cz1]:
-                                rm_candidates.append((cx1, cy1, cz1))
-                        # 收集待填点
-                        cx2, cy2, cz2 = x2 + dx, y2 + dy, z2 + dz
-                        if 0 <= cx2 < nx and 0 <= cy2 < ny and 0 <= cz2 < nz:
-                            if self.current_voxel_grid[cx2, cy2, cz2] == 0.0 and not self.frozen_mask[cx2, cy2, cz2]:
-                                add_candidates.append((cx2, cy2, cz2))
-
-        swap_count = min(len(rm_candidates), len(add_candidates))
-        if swap_count == 0:
-            return False, 0
-
-        # 取两者最小数量
-        for i in range(swap_count):
-            self.current_voxel_grid[rm_candidates[i]] = 0.0
-            self.current_voxel_grid[add_candidates[i]] = 1.0
-
-        return True, swap_count
-
-    def _get_obs(self, temp=None, evap=None):
-        obs = np.zeros(self.observation_space.shape, dtype=np.float32)
-        inside_dist = distance_transform_edt(self.current_voxel_grid)
-        outside_dist = distance_transform_edt(1 - self.current_voxel_grid)
-        sdf = inside_dist - outside_dist
-        obs[0] = np.clip(sdf / 50.0, -1.0, 1.0)
-        if temp is not None: obs[1] = np.clip(temp / 3600.0, 0.0, 1.0)
-        if evap is not None:
-            safe_evap = np.maximum(evap, 1e-15) 
-            obs[2] = np.clip((np.log10(safe_evap) + 15.0) / 10.0, 0.0, 1.0)
+        #  Ch 1: 温度
+        temp_norm = np.zeros(target_shape, dtype=np.float32)
+        if temp is not None: 
+            # 降采样温度场
+            temp_down = ndimage.zoom(temp, zoom_factor, order=1)
+            temp_norm = np.clip(temp_down / 3500.0, 0.0, 1.0)
+        
+        # Ch 2: 寿命
+        lifespan_norm = np.zeros(target_shape, dtype=np.float32)
+        if lifespan_map is not None:
+            # 降采样寿命场
+            lifespan_down = ndimage.zoom(lifespan_map, zoom_factor, order=1)
+            safe_lifespan = np.maximum(lifespan_down, 1.0) 
+            lifespan_norm = np.clip((np.log10(safe_lifespan) - 1.0) / 4.0, 0.0, 1.0)
+            
+        obs = np.stack([sdf_norm, temp_norm, lifespan_norm], axis=0).astype(np.float32)
+        
         return obs
 
-class Custom3DCNN(BaseFeaturesExtractor):
-    # 定义三维神经网络
+    def _calculate_lifespan_map(self, binary_grid, evap_map):
+        binary_gpu = cp.asarray(binary_grid)
+        edt_dist = cp.asnumpy(c_edt(binary_gpu))
+        del binary_gpu
+        cp.get_default_memory_pool().free_all_blocks()
+    
+        valid_mask = (binary_grid > 0.5)
+        safe_evap = np.maximum(evap_map, 1e-15)
+        lifespan_map = np.zeros_like(evap_map)
+        lifespan_map[valid_mask] = (0.1 * edt_dist[valid_mask] * (VOXEL_SIZE / 1000.0) * RHO_DENSITY) / safe_evap[valid_mask]
+        lifespan_map[~valid_mask] = 0.0
+        return lifespan_map
+
+class Topo_3DCNN(BaseFeaturesExtractor):
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256):
-        super(Custom3DCNN, self).__init__(observation_space, features_dim)
-        n_input_channels = observation_space.shape[0]
-        
+        super(Topo_3DCNN, self).__init__(observation_space, features_dim)
         self.cnn = nn.Sequential(
-            nn.Conv3d(n_input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=2, stride=2), 
-            
-            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=2, stride=2), 
-            
-            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool3d(kernel_size=2, stride=2),
-            
+            nn.Conv3d(3, 32, kernel_size=3, stride=1, padding=1), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1), nn.ReLU(), nn.MaxPool3d(2),
+            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1), nn.ReLU(), nn.MaxPool3d(2),
             nn.Flatten()
         )
-        
         with torch.no_grad():
-            sample_input = torch.as_tensor(observation_space.sample()[None]).float()
-            n_flatten = self.cnn(sample_input).shape[1]
-
-        self.linear = nn.Sequential(
-            nn.Linear(n_flatten, features_dim),
-            nn.ReLU()
-        )
+            n_flatten = self.cnn(torch.as_tensor(observation_space.sample()[None]).float()).shape[1]
+        self.linear = nn.Sequential(nn.Linear(n_flatten, features_dim), nn.ReLU())
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.linear(self.cnn(observations))
 
-# 运行主程序
+    # 主程序
 if __name__ == "__main__":
-    env = TungstenTopologyEnv()
-    
+    torch.set_num_threads(16) 
+    print("正在启动 COMSOL 客户端...")
+    global_client = mph.start(cores=16)
+
+    # 初始化环境
+    env = TungstenTopologyEnv(global_client)
+    init_life = env.initial_life 
+    init_rad = env.initial_radiation 
+    init_eff = env.initial_efficiency
+    print(f"【基准】寿命: {init_life:.2e}s | 辐射: {init_rad:.2f}W | 效率: {init_eff*100:.2f}%")
+
     policy_kwargs = dict(
-        features_extractor_class=Custom3DCNN,
+        features_extractor_class=Topo_3DCNN,
         features_extractor_kwargs=dict(features_dim=256),
         normalize_images=False 
     )
@@ -358,14 +360,23 @@ if __name__ == "__main__":
         "CnnPolicy", 
         env, 
         policy_kwargs=policy_kwargs, 
-        n_steps=512,
-        batch_size=32, 
+        n_steps=128,
+        batch_size=16, 
         learning_rate=3e-4,
-        n_epochs=10, 
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.01,
         verbose=1, 
+        device="cuda",
         tensorboard_log="./tungsten_ppo_tensorboard/"
     )
     
     print("开始强化学习训练...")
-    model.learn(total_timesteps=10000)
-    model.save("ppo_tungsten_3D_optimized")
+    model.learn(total_timesteps=100)
+    model.save("ppo_tungsten_3D__optimized")
+    
+    # 训练结束
+    global_client.clear()
+    print("训练完成，模型与演化日志已保存。")

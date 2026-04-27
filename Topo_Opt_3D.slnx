@@ -1,0 +1,10 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="Any GPU" />
+  </Configurations>
+  <Project Path="Topo_Opt_3D/Topo_Opt_3D.pyproj" Type="888888a0-9f3d-457c-b088-3a5042f75d52" Id="9e15f8af-4b63-4f9e-a6de-336980a4ecc1">
+    <Platform Project="AnyCPU" />
+    <Build Project="false" />
+  </Project>
+</Solution>
