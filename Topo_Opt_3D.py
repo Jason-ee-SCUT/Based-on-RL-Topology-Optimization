@@ -82,10 +82,11 @@ class TungstenTopologyEnv(gym.Env):
         try:
             mesh_tags = init_model.java.component("comp1").mesh().tags()
             if len(mesh_tags) > 0:
-                init_model.java.component("comp1").mesh(str(mesh_tags[0])).run()
+                init_model.java.component("comp1").mesh(mesh_tags[0]).run()
                 
-            study_tags = init_model.java.study().tags()
-            init_model.java.study(str(study_tags[0])).run()
+            study_tags = list(init_model.java.study().tags())
+            if len(study_tags) > 0:
+                init_model.java.study(study_tags[0]).run()
             
             # 提取性能
             net_rad = float(init_model.evaluate('Total_Rad'))
@@ -210,8 +211,13 @@ class TungstenTopologyEnv(gym.Env):
             geom = model.java.component("comp1").geom("geom1")
             geom.feature("imp1").set("filename", stl_path)
             geom.run()
-            model.java.component("comp1").mesh(str(model.java.component("comp1").mesh().tags()[0])).run()
-            model.java.study(str(model.java.study().tags()[0])).run()
+            mesh_tags = list(model.java.component("comp1").mesh().tags())
+            if len(mesh_tags) > 0:
+                model.java.component("comp1").mesh(mesh_tags[0]).run()
+    
+            study_tags = list(model.java.study().tags())
+            if len(study_tags) > 0:
+                model.java.study(study_tags[0]).run()
 
             net_rad = float(model.evaluate('Total_Rad'))       
             p_in = float(model.evaluate('P_in'))           
@@ -417,9 +423,9 @@ class Topo_3DCNN(BaseFeaturesExtractor):
 
 # 主程序
 if __name__ == "__main__":
-    torch.set_num_threads() 
+    torch.set_num_threads(2) 
     logger.info("正在启动 COMSOL 客户端...")
-    global_client = mph.start()
+    global_client = mph.start(cores=12)
 
     # 初始化环境
     env = TungstenTopologyEnv(global_client)
@@ -451,7 +457,7 @@ if __name__ == "__main__":
     )
     
     logger.info("开始强化学习训练...")
-    model.learn(total_timesteps=10000)
+    model.learn(total_timesteps=100)
     model.save("ppo_tungsten_3D__optimized")
     
     # 训练结束
