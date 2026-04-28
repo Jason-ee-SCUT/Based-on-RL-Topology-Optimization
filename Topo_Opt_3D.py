@@ -15,6 +15,10 @@ from physics_tools import (
     GRID_SIZE, VOXEL_SIZE, RHO_DENSITY,
     initialize_cylinder_grid, calculate_evaporation_rate, 
 )
+from logger_utils import setup_logger
+
+# 初始化日志记录器
+logger = setup_logger(__name__)
 
 class TungstenTopologyEnv(gym.Env):
     def __init__(self, client):
@@ -65,7 +69,7 @@ class TungstenTopologyEnv(gym.Env):
         self._initialize_baseline()
 
     def _initialize_baseline(self):
-        print("正在提取基准性能...")
+        logger.info("正在提取基准性能...")
         current_path = os.path.dirname(os.path.abspath(__file__))
         init_model_path = os.path.join(current_path, 'Topo_Init_3D.mph')
 
@@ -122,7 +126,12 @@ class TungstenTopologyEnv(gym.Env):
         self.base_lifespan_map = self._calculate_lifespan_map(binary_grid, evap_map)
         self.initial_life = np.min(self.base_lifespan_map[binary_grid > 0.5])
         
-        print(f"【基准参数】寿命: {self.initial_life:.2e}s | 辐射: {self.initial_radiation:.2f}W | 效率: {self.initial_efficiency*100:.2f}%")
+        logger.info(
+            f"基准参数 | "
+            f"寿命：{self.initial_life:.2e}s | "
+            f"辐射：{self.initial_radiation:.2f}W | "
+            f"效率：{self.initial_efficiency*100:.2f}%"
+        )
 
     def _initialize_masks(self):
         nx, ny, nz = self.grid_size
@@ -217,6 +226,7 @@ class TungstenTopologyEnv(gym.Env):
                                 (x_g*self.voxel_size, y_g*self.voxel_size, z_g*self.voxel_size), method='nearest')
             temp_map = np.nan_to_num(temp_map.astype(np.float32), nan=300.0)
             # 清理COMSOL缓存
+            model.java.component("comp1").geom("geom1").clear()
             model.java.sol("sol1").clearSolutionData()
             return temp_map, net_rad, p_in, max_temp
             
@@ -263,14 +273,15 @@ class TungstenTopologyEnv(gym.Env):
         try:
             temp_map, net_rad, p_in, max_temp = self._run_comsol_simulation_3d()
         except Exception as e:
-            print(f"COMSOL 运行失败！错误信息: {e}")
+            logger.error(f"COMSOL 运行失败！错误信息: {e}")
             obs = self._get_obs(temp=None, lifespan_map=None)
             return obs, -20.0, True, False, {"error": "COMSOL Fail"}
             
         if max_temp > 3273.15:
+            logger.warning(f"温度超过限制: {max_temp - 273.15:.1f}℃")
             return self._get_obs(temp=temp_map), -15.0, True, False, {"error": "Temp > 3000C"}
 
-        print(f"最高温度: {max_temp - 273.15:.1f}℃, 辐射功率: {net_rad:.2f}W")
+        logger.info(f"最高温度: {max_temp - 273.15:.1f}℃, 辐射功率: {net_rad:.2f}W")
             
         evap_map = calculate_evaporation_rate(temp_map) 
         lifespan_map = self._calculate_lifespan_map(self.current_voxel_grid, evap_map)
@@ -279,7 +290,7 @@ class TungstenTopologyEnv(gym.Env):
         efficiency = net_rad / p_in if p_in > 1e-5 else 0.0 
 
         if self.step_count % 10 == 0: self._save_evolution_frame(efficiency, topo_life)
-        reward = self._calculate_reward(efficiency, topo_life)
+        reward = self._calculate_reward(net_rad, efficiency, topo_life)
         
         obs = self._get_obs(temp=temp_map, lifespan_map=lifespan_map)
         
@@ -298,18 +309,47 @@ class TungstenTopologyEnv(gym.Env):
         # 3器件寿命奖励
         life_ratio = topo_life / self.initial_life
         if life_ratio < 0.3:
-            r_life =np.clip(-10.0 * ((0.3 - life_ratio)/ 0.3)),-10.0,0.0)
+            r_life =np.clip((-10.0 * ((0.3 - life_ratio)/ 0.3)),-10.0,0.0)
         else:
             r_life = np.clip((3.0 * ((life_ratio - 0.3)/0.3)), 0.0, 3.0)
         
         return float(r_rad + r_eff + r_life)
 
-    def _save_evolution_frame(self, efficiency, topo_life):
+    def _save_evolution_frame(self, net_rad, efficiency, topo_life):
+        logger.debug(f"保存演化帧 step={self.step_count}")
+
+        # 格式化性能指标
+        # 辐射功率
+        rad_str = f"{net_rad:.2f}"
+
+        # 效率
+        eff_percent = efficiency * 100.0
+        eff_str = f"{eff_percent:.2f}"
+
+        # 寿命:x分y秒
+        total_seconds = int(topo_life)
+        minutes = total_seconds // 60
+        seconds = total_seconds % 60
+        life_str = f"{minutes}m{seconds:05.2f}s"
+
+        # 保存STL(包含指标摘要)
         verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
         mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
-        mesh.export(os.path.join(self.output_dir, f"frame_{self.step_count:05d}.stl"))
-        with open(os.path.join(self.output_dir, "log.csv"), 'a') as f:
-            f.write(f"{self.step_count},{efficiency:.4f},{topo_life:.2e}\n")
+        stl_filename = f"frame_{self.step_count:05d}_rad{float(rad_str):.0f}W_life{minutes}m.stl"
+        mesh.export(os.path.join(self.output_dir, stl_filename))
+
+        # 记录性能指标
+        log_path = os.path.join(self.output_dir, "performance_log.csv")
+        file_exists = os.path.exists(log_path)
+        with open(log_path, 'a') as f:
+            if not file_exists:
+                f.write("step,net_rad(W),efficiency(%),topo_life(mm:ss)\n")
+            f.write(f"{self.step_count},{rad_str},{eff_str},{life_str}\n")
+
+        logger.info(
+            f"已保存演化拓扑 | Step: {self.step_count} | "
+            f"辐射：{rad_str}W | 效率：{eff_str}% | 寿命：{life_str}"
+        )
 
     def _get_obs(self, temp=None, lifespan_map=None):
         target_shape = (50, 50, 75)        
@@ -375,11 +415,11 @@ class Topo_3DCNN(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         return self.linear(self.cnn(observations))
 
-    # 主程序
+# 主程序
 if __name__ == "__main__":
-    torch.set_num_threads(16) 
-    print("正在启动 COMSOL 客户端...")
-    global_client = mph.start(cores=16)
+    torch.set_num_threads() 
+    logger.info("正在启动 COMSOL 客户端...")
+    global_client = mph.start()
 
     # 初始化环境
     env = TungstenTopologyEnv(global_client)
@@ -410,10 +450,10 @@ if __name__ == "__main__":
         tensorboard_log="./tungsten_ppo_tensorboard/"
     )
     
-    print("开始强化学习训练...")
+    logger.info("开始强化学习训练...")
     model.learn(total_timesteps=10000)
     model.save("ppo_tungsten_3D__optimized")
     
     # 训练结束
     global_client.clear()
-    print("训练完成，模型与演化日志已保存。")
+    logger.info("训练完成，模型与演化日志已保存。")
