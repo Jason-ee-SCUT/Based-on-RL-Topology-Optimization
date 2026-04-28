@@ -11,11 +11,14 @@ from stable_baselines3 import PPO
 import torch
 import torch.nn as nn
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import networkx as nx
 from physics_tools import (
     GRID_SIZE, VOXEL_SIZE, RHO_DENSITY,
     initialize_cylinder_grid, calculate_evaporation_rate, 
+    extract_optimized_mesh
 )
 from logger_utils import setup_logger
+
 
 # 初始化日志记录器
 logger = setup_logger(__name__)
@@ -182,21 +185,6 @@ class TungstenTopologyEnv(gym.Env):
 
         self.current_voxel_grid = (self.density_field >= 0.5).astype(np.float32)
 
-    def _extract_mesh(self):
-        # 提取等值面
-        verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
-        mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
-
-        # 修复网格拓扑
-        mesh.remove_duplicate_faces()      # 删除重复面
-        mesh.remove_degenerate_faces()     # 删除面积为0的退化面
-        mesh.remove_unreferenced_vertices()# 删除孤立的顶点
-        mesh.fill_holes()                  # 封闭微小的孔洞
-        mesh.fix_normals()                 # 法线向外
-        trimesh.smoothing.filter_laplacian(mesh, iterations=2)# 平滑体素
-
-        return mesh
-
     def _run_comsol_simulation_3d(self):
         
         if self.opt_model is None:
@@ -204,7 +192,7 @@ class TungstenTopologyEnv(gym.Env):
 
         model = self.opt_model
         try:
-            mesh = self._extract_mesh()
+            mesh = extract_optimized_mesh(self.density_field, self.voxel_size)
             stl_path = os.path.join(self.output_dir, 'temp_topo.stl')
             mesh.export(stl_path)
 
@@ -295,7 +283,7 @@ class TungstenTopologyEnv(gym.Env):
         
         efficiency = net_rad / p_in if p_in > 1e-5 else 0.0 
 
-        if self.step_count % 10 == 0: self._save_evolution_frame(efficiency, topo_life)
+        if self.step_count % 10 == 0: self._save_evolution_frame(net_rad, efficiency, topo_life)
         reward = self._calculate_reward(net_rad, efficiency, topo_life)
         
         obs = self._get_obs(temp=temp_map, lifespan_map=lifespan_map)
@@ -340,7 +328,7 @@ class TungstenTopologyEnv(gym.Env):
 
         # 保存STL(包含指标摘要)
         verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
-        mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
+        mesh = extract_optimized_mesh(self.density_field, self.voxel_size)
         stl_filename = f"frame_{self.step_count:05d}_rad{float(rad_str):.0f}W_life{minutes}m.stl"
         mesh.export(os.path.join(self.output_dir, stl_filename))
 
@@ -439,6 +427,10 @@ if __name__ == "__main__":
         normalize_images=False 
     )
     
+    # 自动检测 CUDA 可用性
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"使用设备：{device}")
+
     model = PPO(
         "CnnPolicy", 
         env, 
@@ -452,12 +444,12 @@ if __name__ == "__main__":
         clip_range=0.15,
         ent_coef= "auto" ,
         verbose=1, 
-        device="cuda",
+        device=device,
         tensorboard_log="./tungsten_ppo_tensorboard/"
     )
     
     logger.info("开始强化学习训练...")
-    model.learn(total_timesteps=100)
+    model.learn(total_timesteps=10)
     model.save("ppo_tungsten_3D__optimized")
     
     # 训练结束
