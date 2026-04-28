@@ -10,15 +10,10 @@ from skimage import measure
 from stable_baselines3 import PPO
 import torch
 import torch.nn as nn
-import cupy as cp
-from cupyx.scipy.ndimage import distance_transform_edt as c_edt
-from cupyx.scipy.ndimage import gaussian_filter as c_gaussian
-from cupyx.scipy.ndimage import zoom as c_zoom
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from physics_tools import (
     GRID_SIZE, VOXEL_SIZE, RHO_DENSITY,
     initialize_cylinder_grid, calculate_evaporation_rate, 
-     Topo_Init_evaluation
 )
 
 class TungstenTopologyEnv(gym.Env):
@@ -30,10 +25,7 @@ class TungstenTopologyEnv(gym.Env):
         self.rho_density = RHO_DENSITY
         
         self.max_steps = 1000 
-        
         current_path = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_path, 'Topo_Opt_3D.mph')
-        self.model = self.client.load(model_path) if os.path.exists(model_path) else None
             
         # 状态空间为3通道: [SDF边界, 温度场, 寿命场]
         self.observation_space = spaces.Box(
@@ -42,9 +34,14 @@ class TungstenTopologyEnv(gym.Env):
             dtype=np.float32
             )
         
-        # 动作空间：低频连续密度修改
-        self.action_shape = (self.grid_size[0]//5, self.grid_size[1]//5, self.grid_size[2]//5)
-        self.action_space = spaces.Box(low=-0.15, high=0.15, shape=self.action_shape, dtype=np.float32)
+        # 动作空间，每个子动作对应一个粗网格的密度调整，最终通过插值和平滑转换为细网格的密度变化
+        self.num_sub_actions = 5
+        self.sub_action_shape = (self.grid_size[0]//10, self.grid_size[1]//10, self.grid_size[2]//10)
+        self.action_space = spaces.Box(
+            low=-0.15, high=0.15, 
+            shape=(self.num_sub_actions, *self.sub_action_shape), 
+            dtype=np.float32
+        )
         
         self.step_count = 0
         self.output_dir = "./topology_evolution"
@@ -52,40 +49,80 @@ class TungstenTopologyEnv(gym.Env):
         self.target_volume = 0.0
         self._initialize_masks()
 
-        # 基准评估
-        try:
-            init_life, init_rad, init_eff = Topo_Init_evaluation(self.client)
-            self.initial_life = init_life
-            self.initial_radiation = init_rad
-            self.initial_efficiency = init_eff
-            print(f"【基准】寿命: {init_life:.2e}s | 辐射: {init_rad:.2f}W | 效率: {init_eff*100:.2f}%")
-        except Exception as e:
-            print(f"基准提取失败: {e}")
-            self.initial_life, self.initial_radiation, self.initial_efficiency = 100.0, 50.0, 0.5
+        # 加载优化模型
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        opt_model_path = os.path.join(current_path, 'Topo_Opt_3D.mph')
+        self.opt_model = self.client.load(opt_model_path) if os.path.exists(opt_model_path) else None
 
-        # 缓存初始物理场
+        # 初始化指标
+        self.initial_life = 7.48e5
+        self.initial_radiation = 423.34
+        self.initial_efficiency = 1.0
         self.base_temp_map = None
         self.base_lifespan_map = None
-        self._cache_baseline_fields()
 
-    def _cache_baseline_fields(self):
-        print("正在缓存初始圆柱体的 3D 物理场 (仅执行一次)...")
-        # 临时生成一个标准圆柱体
-        binary_grid = initialize_cylinder_grid()
-        self.density_field = binary_grid.astype(np.float32)
-        self.current_voxel_grid = binary_grid.copy()
+        # 基准评估
+        self._initialize_baseline()
+
+    def _initialize_baseline(self):
+        print("正在提取基准性能...")
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        init_model_path = os.path.join(current_path, 'Topo_Init_3D.mph')
+
+        if not os.path.exists(init_model_path):
+            raise FileNotFoundError(f"找不到基准模型: {init_model_path}")
+
+        # 加载基准模型
+        init_model = self.client.load(init_model_path)
         
         try:
-            temp_map, _, _, max_temp = self._run_comsol_simulation_3d()
-            evap_map = calculate_evaporation_rate(temp_map)
-            self.base_temp_map = temp_map
-            self.base_lifespan_map = self._calculate_lifespan_map(self.current_voxel_grid, evap_map)
-            print(f"基准场缓存成功！中心最高温度约: {max_temp:.2f}K")
-        except Exception as e:
-            print(f"缓存基准场失败: {e}，使用假数据")
-            # 假数据
-            self.base_temp_map = np.ones(self.grid_size, dtype=np.float32) * 2500.0
-            self.base_lifespan_map = np.ones(self.grid_size, dtype=np.float32) * 1e5
+            mesh_tags = init_model.java.component("comp1").mesh().tags()
+            if len(mesh_tags) > 0:
+                init_model.java.component("comp1").mesh(str(mesh_tags[0])).run()
+                
+            study_tags = init_model.java.study().tags()
+            init_model.java.study(str(study_tags[0])).run()
+            
+            # 提取性能
+            net_rad = float(init_model.evaluate('Total_Rad'))
+            p_in = float(init_model.evaluate('P_in'))
+            
+            # 提取物理场
+            x_coords = init_model.evaluate('x') * 1000
+            y_coords = init_model.evaluate('y') * 1000
+            z_coords = init_model.evaluate('z') * 1000
+            temp_points = init_model.evaluate('T')
+            
+            nx, ny, nz = self.grid_size
+            x_g, y_g, z_g = np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz), indexing='ij')
+            
+            # 插值到网格上
+            temp_map = griddata(
+                (x_coords.ravel(), y_coords.ravel(), z_coords.ravel()), 
+                temp_points.ravel(), 
+                (x_g * self.voxel_size, y_g * self.voxel_size, z_g * self.voxel_size), 
+                method='nearest'
+            ).astype(np.float32)
+            temp_map = np.nan_to_num(temp_map, nan=300.0)
+            
+        finally:
+            # 释放内存
+            init_model.clear()
+            del init_model
+
+        # 计算并保存基准指标
+        self.initial_radiation = net_rad
+        self.initial_efficiency = (net_rad / p_in) if p_in > 1e-5 else 0.0
+        
+        # 5. 计算并缓存三维图谱
+        evap_map = calculate_evaporation_rate(temp_map)
+        binary_grid = initialize_cylinder_grid()
+        
+        self.base_temp_map = temp_map
+        self.base_lifespan_map = self._calculate_lifespan_map(binary_grid, evap_map)
+        self.initial_life = np.min(self.base_lifespan_map[binary_grid > 0.5])
+        
+        print(f"【基准参数】寿命: {self.initial_life:.2e}s | 辐射: {self.initial_radiation:.2f}W | 效率: {self.initial_efficiency*100:.2f}%")
 
     def _initialize_masks(self):
         nx, ny, nz = self.grid_size
@@ -108,40 +145,14 @@ class TungstenTopologyEnv(gym.Env):
         self.current_voxel_grid = binary_grid.copy()
         self.step_count = 0
         
-        # 复用初始物理场
+        # 复用基准指标
         return self._get_obs(temp=self.base_temp_map, lifespan_map=self.base_lifespan_map), {}
 
-    def _apply_density_action(self, action):
-        action_gpu = cp.asarray(action)
-        zoom_factors = (self.grid_size[0]/self.action_shape[0], 
-                self.grid_size[1]/self.action_shape[1], 
-                self.grid_size[2]/self.action_shape[2])
-        delta_rho = c_zoom(action_gpu, zoom_factors, order=1) 
-        delta_rho = c_gaussian(delta_rho, sigma=1.2)
-        delta_rho = cp.asnumpy(delta_rho) 
-
-        # 释放内存
-        del action_gpu
-        cp.get_default_memory_pool().free_all_blocks()
-    
-        # 防止形状不匹配
-        target_shape = self.grid_size
-        pad_width = []
-        for i in range(3):
-          diff = target_shape[i] - delta_rho.shape[i]
-          if diff > 0:
-            pad_width.append((0, diff))
-          elif diff < 0:
-            pad_width.append((0, 0))
-            delta_rho = delta_rho[(slice(None),) * i + (slice(0, target_shape[i]),)]
-          else:
-            pad_width.append((0, 0))
-        if any(p[1] > 0 for p in pad_width):
-          delta_rho = np.pad(delta_rho, pad_width, mode='edge')
-    
-        raw_density = self.density_field + delta_rho
+    def _apply_density_action(self, total_delta_rho):
+        # total_delta_rho是(100, 100, 150) 张量，代表5个子动作叠加后的总密度变化意图。
+        raw_density = self.density_field + total_delta_rho
         
-        # 二分法体积守恒投影
+        # 二分法投影
         def calc_vol(offset):
             projected = np.clip(raw_density[self.valid_mask] + offset, 0.0, 1.0)
             return np.sum(projected)
@@ -162,17 +173,26 @@ class TungstenTopologyEnv(gym.Env):
         self.current_voxel_grid = (self.density_field >= 0.5).astype(np.float32)
 
     def _extract_mesh(self):
+        # 提取等值面
         verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
         mesh = trimesh.Trimesh(vertices=verts * self.voxel_size, faces=faces)
-        trimesh.smoothing.filter_laplacian(mesh, iterations=2)
+
+        # 修复网格拓扑
+        mesh.remove_duplicate_faces()      # 删除重复面
+        mesh.remove_degenerate_faces()     # 删除面积为0的退化面
+        mesh.remove_unreferenced_vertices()# 删除孤立的顶点
+        mesh.fill_holes()                  # 封闭微小的孔洞
+        mesh.fix_normals()                 # 法线向外
+        trimesh.smoothing.filter_laplacian(mesh, iterations=2)# 平滑体素
+
         return mesh
 
     def _run_comsol_simulation_3d(self):
-        if self.model is None:
-            print("未找到基准模型，用假数据调试代码")
-            return np.ones(self.grid_size)*2500.0, 50.0, 100.0, 2500.0
+        
+        if self.opt_model is None:
+             raise RuntimeError("未找到优化模型...")
 
-        model = self.model
+        model = self.opt_model
         try:
             mesh = self._extract_mesh()
             stl_path = os.path.join(self.output_dir, 'temp_topo.stl')
@@ -197,7 +217,6 @@ class TungstenTopologyEnv(gym.Env):
                                 (x_g*self.voxel_size, y_g*self.voxel_size, z_g*self.voxel_size), method='nearest')
             temp_map = np.nan_to_num(temp_map.astype(np.float32), nan=300.0)
             # 清理COMSOL缓存
-            model.java.mesh(str(model.java.component("comp1").mesh().tags()[0])).clear()
             model.java.sol("sol1").clearSolutionData()
             return temp_map, net_rad, p_in, max_temp
             
@@ -208,54 +227,82 @@ class TungstenTopologyEnv(gym.Env):
         labeled_array, num_features = ndimage.label(self.current_voxel_grid)
         return num_features == 1
 
-    def step(self, action):
+    def step(self, macro_action):
         self.step_count += 1
-        self._apply_density_action(action)
+        
+        # 初始化总增量场
+        total_delta_rho = np.zeros(self.grid_size, dtype=np.float32)
+        
+        # 遍历5个子动作，分别上采样并累加
+        zoom_factors = (self.grid_size[0]/self.sub_action_shape[0], 
+                        self.grid_size[1]/self.sub_action_shape[1], 
+                        self.grid_size[2]/self.sub_action_shape[2])
+        
+        for i in range(self.num_sub_actions):
+            sub_action = macro_action[i] # shape: (10, 10, 15)
             
+            delta_rho = ndimage.zoom(sub_action, zoom_factors, order=1) 
+            delta_rho = ndimage.gaussian_filter(delta_rho, sigma=1.5)
+            
+            # 处理因为缩放导致的边缘像素差
+            delta_rho = delta_rho[:self.grid_size[0], :self.grid_size[1], :self.grid_size[2]]
+            
+            # 累加到总增量中
+            total_delta_rho += delta_rho
+            
+        # 应用总增量，并约束体积
+        self._apply_density_action(total_delta_rho)
+            
+        # 连通性检查
         if not self._check_structural_integrity():
-            return self._get_obs(), -50.0, True, False, {"error": "Fragmentation"}
+            # 如果断裂，使用上一次成功的物理场返回错误信息，并给惩罚
+            obs = self._get_obs(temp=None, lifespan_map=None) 
+            return obs, -10.0, True, False, {"error": "Fragmentation"}
             
+        # 执行COMSOL仿真
         try:
             temp_map, net_rad, p_in, max_temp = self._run_comsol_simulation_3d()
         except Exception as e:
-            return self._get_obs(), -80.0, True, False, {"error": "COMSOL Fail"}
+            print(f"COMSOL 运行失败！错误信息: {e}")
+            obs = self._get_obs(temp=None, lifespan_map=None)
+            return obs, -20.0, True, False, {"error": "COMSOL Fail"}
             
         if max_temp > 3273.15:
-            return self._get_obs(temp_map=temp_map), -50.0, True, False, {"error": "Temp > 3000C"}
+            return self._get_obs(temp=temp_map), -15.0, True, False, {"error": "Temp > 3000C"}
+
+        print(f"最高温度: {max_temp - 273.15:.1f}℃, 辐射功率: {net_rad:.2f}W")
             
         evap_map = calculate_evaporation_rate(temp_map) 
-        
-        # 计算全空间寿命图谱
         lifespan_map = self._calculate_lifespan_map(self.current_voxel_grid, evap_map)
-        topo_life = np.min(lifespan_map[self.current_voxel_grid > 0.5]) # 提取最短寿命用于奖励
+        topo_life = np.min(lifespan_map[self.current_voxel_grid > 0.5])
         
         efficiency = net_rad / p_in if p_in > 1e-5 else 0.0 
 
         if self.step_count % 10 == 0: self._save_evolution_frame(efficiency, topo_life)
         reward = self._calculate_reward(efficiency, topo_life)
         
-        # 传入 temp_map 和 lifespan_map
-        obs = self._get_obs(temp_map, lifespan_map)
+        obs = self._get_obs(temp=temp_map, lifespan_map=lifespan_map)
         
         truncated = bool(self.step_count >= self.max_steps)
         return obs, reward, False, truncated, {"life": topo_life, "rad": net_rad, "eff": efficiency}
-        
-    def _calculate_reward(self, efficiency, topo_life):
-        # 计算奖励
-        # 能量转换效率增益 (目标提升>30%)
+
+    def _calculate_reward(self, net_rad, topo_life, efficiency):
+        # 1辐射功率奖励
+        rad_gain = (net_rad - self.initial_radiation) / self.initial_radiation
+        r_rad = np.clip(20.0 * rad_gain, -10.0, 10.0)
+    
+        # 2效率提升奖励
         eff_gain = (efficiency - self.initial_efficiency) / self.initial_efficiency
-        r_eff = 15.0 * np.tanh(4.0 * eff_gain) 
-        
-        # 寿命约束与激励 (目标 > 50%)
+        r_eff = np.clip(10.0 * eff_gain, -5.0, 5.0)
+    
+        # 3器件寿命奖励
         life_ratio = topo_life / self.initial_life
         if life_ratio < 0.3:
-            # 触碰红线给予平方级惩罚
-            r_life = -100.0 * ((0.3 - life_ratio) / 0.3) ** 2
+            r_life =np.clip(-10.0 * ((0.3 - life_ratio)/ 0.3)),-10.0,0.0)
         else:
-            # 鼓励向50%以上突破
-            r_life = 10.0 * np.tanh(3.0 * (life_ratio - 0.3))
-            
-        return float(r_eff + r_life)
+            r_life = np.clip((3.0 * ((life_ratio - 0.3)/0.3)), 0.0, 3.0)
+        
+        return float(r_rad + r_eff + r_life)
 
     def _save_evolution_frame(self, efficiency, topo_life):
         verts, faces, _, _ = measure.marching_cubes(self.density_field, level=0.5)
@@ -273,15 +320,10 @@ class TungstenTopologyEnv(gym.Env):
             )
         
         #  Ch 0: SDF
-        voxel_gpu = cp.asarray(self.current_voxel_grid)
-        inside_dist = c_edt(voxel_gpu)
-        outside_dist = c_edt(1 - voxel_gpu)
-        sdf_full = cp.asnumpy(inside_dist - outside_dist)
+        inside_dist = ndimage.distance_transform_edt(self.current_voxel_grid)
+        outside_dist = ndimage.distance_transform_edt(1 - self.current_voxel_grid)
+        sdf_full = inside_dist - outside_dist
         
-        # 释放GPU
-        del voxel_gpu, inside_dist, outside_dist
-        cp.get_default_memory_pool().free_all_blocks()
-
         # 降采样 SDF
         sdf_down = ndimage.zoom(sdf_full, zoom_factor, order=1)
         
@@ -305,14 +347,10 @@ class TungstenTopologyEnv(gym.Env):
             lifespan_norm = np.clip((np.log10(safe_lifespan) - 1.0) / 4.0, 0.0, 1.0)
             
         obs = np.stack([sdf_norm, temp_norm, lifespan_norm], axis=0).astype(np.float32)
-        
         return obs
 
     def _calculate_lifespan_map(self, binary_grid, evap_map):
-        binary_gpu = cp.asarray(binary_grid)
-        edt_dist = cp.asnumpy(c_edt(binary_gpu))
-        del binary_gpu
-        cp.get_default_memory_pool().free_all_blocks()
+        edt_dist = ndimage.distance_transform_edt(binary_grid)
     
         valid_mask = (binary_grid > 0.5)
         safe_evap = np.maximum(evap_map, 1e-15)
@@ -348,7 +386,6 @@ if __name__ == "__main__":
     init_life = env.initial_life 
     init_rad = env.initial_radiation 
     init_eff = env.initial_efficiency
-    print(f"【基准】寿命: {init_life:.2e}s | 辐射: {init_rad:.2f}W | 效率: {init_eff*100:.2f}%")
 
     policy_kwargs = dict(
         features_extractor_class=Topo_3DCNN,
@@ -360,21 +397,21 @@ if __name__ == "__main__":
         "CnnPolicy", 
         env, 
         policy_kwargs=policy_kwargs, 
-        n_steps=128,
-        batch_size=16, 
-        learning_rate=3e-4,
+        n_steps=256,
+        batch_size=32, 
+        learning_rate=1.5e-4,
         n_epochs=10,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.01,
+        clip_range=0.15,
+        ent_coef= "auto" ,
         verbose=1, 
         device="cuda",
         tensorboard_log="./tungsten_ppo_tensorboard/"
     )
     
     print("开始强化学习训练...")
-    model.learn(total_timesteps=100)
+    model.learn(total_timesteps=10000)
     model.save("ppo_tungsten_3D__optimized")
     
     # 训练结束
